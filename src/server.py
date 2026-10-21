@@ -14169,7 +14169,7 @@ def _check_proxy_media_compatibility_checked(root, p: Dict[str, Any]):
     )
 
 
-def _timeline_append_readback_snapshot(proj):
+def _timeline_append_readback_snapshot(proj, *, include_ranges=False):
     try:
         tl = proj.GetCurrentTimeline() if proj else None
     except Exception as exc:
@@ -14187,11 +14187,22 @@ def _timeline_append_readback_snapshot(proj):
     except Exception:
         timeline["id"] = None
 
+    def native_frame(item, method):
+        try:
+            value = float(getattr(item, method)())
+            return int(value) if value.is_integer() else None
+        except Exception:
+            return None
+
     tracks = {}
     item_count = 0
     warnings = []
     for track_type in ("video", "audio", "subtitle"):
-        track_count = _timeline_track_count(tl, track_type)
+        try:
+            track_count = int(tl.GetTrackCount(track_type))
+        except Exception as exc:
+            warnings.append(f"GetTrackCount({track_type}) failed: {exc}")
+            track_count = 0
         rows = []
         for track_index in range(1, track_count + 1):
             try:
@@ -14200,14 +14211,38 @@ def _timeline_append_readback_snapshot(proj):
                 warnings.append(f"GetItemListInTrack({track_type}, {track_index}) failed: {exc}")
                 items = []
             item_count += len(items)
-            rows.append({
+            row = {
                 "track_index": track_index,
                 "item_count": len(items),
                 "item_ids": _timeline_item_ids(items),
-            })
+            }
+            if len(row["item_ids"]) != len(items):
+                warnings.append(f"Unreadable item identity on {track_type} {track_index}")
+            if include_ranges:
+                row["items"] = []
+                for item in items:
+                    summary = _timeline_item_summary(item, (track_type, track_index))
+                    # Unlike the general summary's duration fallback, this is an
+                    # independent source-end observation. It is exclusive only
+                    # at matched rates, which the exact comparator requires.
+                    summary["record_start_frame_readback"] = native_frame(item, "GetStart")
+                    summary["record_end_frame_readback"] = native_frame(item, "GetEnd")
+                    summary["record_duration_frame_readback"] = native_frame(item, "GetDuration")
+                    summary["source_start_frame_readback"] = native_frame(item, "GetSourceStartFrame")
+                    summary["source_end_frame_readback"] = native_frame(item, "GetSourceEndFrame")
+                    row["items"].append(summary)
+                summary_ids = [item["timeline_item_id"] for item in row["items"]]
+                if any(not uid for uid in summary_ids) or summary_ids != row["item_ids"]:
+                    warnings.append(f"Inconsistent item identity on {track_type} {track_index}")
+            rows.append(row)
         tracks[track_type] = {"track_count": track_count, "tracks": rows}
+    try:
+        frame_rate = float(tl.GetSetting("timelineFrameRate")) if include_ranges else None
+    except Exception:
+        frame_rate = None
     return {
         "available": True,
+        "frame_rate": frame_rate,
         "timeline": timeline,
         "item_count": item_count,
         "tracks": tracks,
@@ -14215,12 +14250,81 @@ def _timeline_append_readback_snapshot(proj):
     }
 
 
-def _compare_timeline_append_readback(before, observed, expected_count: int):
+def _compare_timeline_append_readback(before, observed, expected_count: int, expected_rows=None):
     before_count = before.get("item_count") if isinstance(before, dict) and before.get("available") else None
     after_count = observed.get("item_count") if isinstance(observed, dict) and observed.get("available") else None
     delta = after_count - before_count if before_count is not None and after_count is not None else None
+    issues = []
+    complete = before_count is not None and after_count is not None
+    if not complete:
+        issues.append("Timeline readback unavailable")
+    elif (before.get("warnings") or observed.get("warnings")):
+        issues.append("Timeline track walk incomplete")
+    if complete and (not before["timeline"].get("id") or before["timeline"]["id"] != observed["timeline"].get("id")):
+        issues.append("Timeline identity changed or unavailable")
+
+    def items(snapshot):
+        return [item for group in snapshot.get("tracks", {}).values()
+                for track in group["tracks"] for item in track.get("items", [])]
+
+    if expected_rows is not None and complete:
+        old_items, new_items = items(before), items(observed)
+        old = {item["timeline_item_id"]: item for item in old_items}
+        current = {item["timeline_item_id"]: item for item in new_items}
+        if len(old) != len(old_items) or len(current) != len(new_items):
+            issues.append("Timeline item identities are not unique")
+        if any(current.get(uid) != item for uid, item in old.items()):
+            issues.append("Existing timeline placements changed")
+        added = [item for uid, item in current.items() if uid not in old]
+        remaining = list(added)
+        rate = observed.get("frame_rate")
+        if not rate or rate <= 0 or before.get("frame_rate") != rate:
+            issues.append("Timeline frame rate changed or unavailable")
+        for index, row in enumerate(expected_rows):
+            media_type = row.get("mediaType")
+            if media_type not in (1, 2):
+                issues.append(f"clip_infos[{index}]: exact verification requires an explicit media_type")
+                continue
+            try:
+                source_start = float(row["startFrame"])
+                source_end = float(row["endFrame"])
+            except (TypeError, ValueError, OverflowError):
+                source_start = source_end = float("nan")
+            if not source_start.is_integer() or not source_end.is_integer() or source_end <= source_start:
+                issues.append(f"clip_infos[{index}]: source range unavailable for verification")
+                continue
+            source_start, source_end = int(source_start), int(source_end)
+            duration = source_end - source_start
+            expected = {
+                "media_pool_item_id": _safe_media_pool_item_id(row["mediaPoolItem"]),
+                "track_type": "video" if media_type == 1 else "audio",
+                "track_index": row["trackIndex"],
+                "start": row["recordFrame"],
+                "end": row["recordFrame"] + duration,
+                "duration": duration,
+                "source_start": source_start,
+                "source_end": source_end,
+                "record_start_frame_readback": row["recordFrame"],
+                "record_end_frame_readback": row["recordFrame"] + duration,
+                "record_duration_frame_readback": duration,
+                "source_start_frame_readback": source_start,
+                "source_end_frame_readback": source_end,
+            }
+            match = next((item for item in remaining
+                          if all(item.get(key) == value for key, value in expected.items())
+                          and item.get("source_fps") and rate
+                          and abs(item["source_fps"] - rate) < 0.001), None)
+            if not expected["media_pool_item_id"] or match is None:
+                issues.append(f"clip_infos[{index}]: exact matched-rate placement not observed")
+            else:
+                remaining.remove(match)
+        if remaining or len(added) != expected_count:
+            issues.append("Unexpected appended timeline items")
+    count_verified = delta is not None and delta >= expected_count and expected_count > 0
     return {
-        "verified": delta is not None and delta >= expected_count and expected_count > 0,
+        "verified": count_verified and not issues,
+        "verification_scope": "exact_placement" if expected_rows is not None else "item_count",
+        "issues": issues,
         "before_item_count": before_count,
         "after_item_count": after_count,
         "item_count_delta": delta,
@@ -14230,7 +14334,8 @@ def _compare_timeline_append_readback(before, observed, expected_count: int):
 
 def _append_to_timeline_with_verification(proj, mp, append_payload, requested: Dict[str, Any], expected_count: int):
     raw_result = {"value": None}
-    before = _timeline_append_readback_snapshot(proj)
+    positioned = requested.get("mode") == "clip_infos"
+    before = _timeline_append_readback_snapshot(proj, include_ranges=positioned)
 
     def mutate():
         raw_result["value"] = mp.AppendToTimeline(append_payload)
@@ -14238,12 +14343,13 @@ def _append_to_timeline_with_verification(proj, mp, append_payload, requested: D
 
     verification = verify_by_readback(
         mutate=mutate,
-        observe=lambda: _timeline_append_readback_snapshot(proj),
+        observe=lambda: _timeline_append_readback_snapshot(proj, include_ranges=positioned),
         snapshot=lambda: before,
         compare=lambda before_snapshot, observed: _compare_timeline_append_readback(
             before_snapshot,
             observed,
             expected_count,
+            expected_rows=append_payload if positioned else None,
         ),
         intent=requested,
         label="media_pool.append_to_timeline",
@@ -14256,6 +14362,8 @@ def _append_to_timeline_verified_operation(requested: Dict[str, Any], verificati
     verified = bool(verification.get("verified"))
     verification_status = "readback_verified" if verified else ("api_failed" if not success else "api_success_unverified")
     readback = {
+        "verification_scope": verification.get("verification_scope"),
+        "issues": verification.get("issues", []),
         "before": before,
         "after": verification.get("observed"),
         "before_item_count": verification.get("before_item_count"),

@@ -2208,6 +2208,17 @@ the error. `error.retryable` is true only when that readback shows nothing was
 appended; otherwise inspect the timeline before retrying, or the clips can land
 twice. The granular `append_to_timeline` answers `{"success": false, "error": ...}`.
 
+Positioned append verification compares newly observed occurrences against the requested
+Media Pool item, source range, destination range and track when `media_type` is
+explicit and source/timeline frame rates match. Read `verified_operation.readback`:
+`verification_scope` distinguishes `exact_placement` from the simple append's
+`item_count` check, and `issues` explains incomplete or contradictory evidence.
+Unknown or mixed frame rates, an unspecified stream, inconsistent item identity,
+fractional source bounds, or unreadable native source bounds cannot establish
+exact placement. An API success with `api_success_unverified` is not permission to
+retry: inspect the existing occurrences first. This does not verify rendered
+picture, audio, grades or effects.
+
 Mixed-fps caution: `start_frame`/`end_frame` are SOURCE frames, and a source
 whose fps differs from the timeline's rounds DOWN on conversion — a 24.0 or
 29.97 clip appended into a 23.976 timeline can land one frame short of its
